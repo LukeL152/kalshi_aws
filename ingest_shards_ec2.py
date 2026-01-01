@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import os
 import random
 import time
 import uuid
@@ -314,39 +313,60 @@ def _norm_prefix(p: str) -> str:
     return p.strip("/")
 
 
-def claim_shard(s3, bucket: str, prefix: str, log: logging.Logger) -> Optional[str]:
+def claim_shard(
+    s3,
+    *,
+    bucket: str,
+    prefix: str,
+    log: logging.Logger,
+) -> Optional[str]:
     """
-    Best-effort claim:
-      - list 1 pending object
-      - copy -> running/
-      - delete pending
-    Note: not perfectly atomic, but OK if contention is low; can harden later with lock objects.
+    Atomically claims a shard by copying:
+        pending/<shard> → running/<shard>
+    using If-None-Match='*' as the lock.
+
+    Returns shard filename if claimed, else None.
     """
-    prefix = _norm_prefix(prefix)
+
+    prefix = prefix.strip("/")
     pending_prefix = f"{prefix}/pending/"
     running_prefix = f"{prefix}/running/"
 
-    resp = s3.list_objects_v2(Bucket=bucket, Prefix=pending_prefix, MaxKeys=1)
+    # 1. List ONE pending shard
+    resp = s3.list_objects_v2(
+        Bucket=bucket,
+        Prefix=pending_prefix,
+        MaxKeys=1,
+    )
+
     items = resp.get("Contents", [])
     if not items:
         return None
 
-    key = items[0]["Key"]
-    shard_name = key.split("/")[-1]
-    dest_key = f"{running_prefix}{shard_name}"
+    src_key = items[0]["Key"]
+    shard_name = src_key.rsplit("/", 1)[-1]
+    dst_key = f"{running_prefix}{shard_name}"
 
+    # 2. Atomic claim: copy ONLY if running/<shard> does not exist
     try:
         s3.copy_object(
             Bucket=bucket,
-            CopySource={"Bucket": bucket, "Key": key},
-            Key=dest_key,
+            Key=dst_key,
+            CopySource={"Bucket": bucket, "Key": src_key},
+            CopySourceIfNoneMatch="*",  # 🔐 atomic lock
         )
-        s3.delete_object(Bucket=bucket, Key=key)
-        log.info(f"CLAIM shard={shard_name}")
-        return shard_name
     except ClientError as e:
-        log.warning(f"Claim failed (race?): {e}")
-        return None
+        code = e.response["Error"]["Code"]
+        if code in ("PreconditionFailed", "412"):
+            # Another worker already claimed it
+            return None
+        raise
+
+    # 3. Remove from pending immediately
+    s3.delete_object(Bucket=bucket, Key=src_key)
+
+    log.info(f"CLAIMED shard={shard_name}")
+    return shard_name
 
 
 def finalize_shard(
@@ -507,4 +527,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
