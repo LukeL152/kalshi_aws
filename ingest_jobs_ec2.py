@@ -1,12 +1,14 @@
-# ingest/market_candlesticks/ingest_batches.py
+# /ingest_jobs_ec2.py
 from __future__ import annotations
 
 import argparse
 import json
 import logging
+import os
 import random
 import time
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from time import perf_counter
@@ -15,7 +17,8 @@ from typing import Optional, Dict, Any
 import duckdb
 import requests
 
-from config.config import load_config
+import boto3
+from botocore.exceptions import BotoCoreError, ClientError
 
 # ============================================================
 # CONSTANTS (API semantics)
@@ -39,34 +42,93 @@ BASE_HEADERS = {
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Kalshi candlestick batch worker (one batch per job)"
+        description="Kalshi candlestick batch worker (claims from DuckDB, calls batch URL, writes parquet, uploads to S3)."
     )
-    p.add_argument("--batch-start", type=int)
-    p.add_argument("--batch-end", type=int)
-    p.add_argument("--limit", type=int)
+
+    # job selection
+    p.add_argument("--batch-start", type=int, default=None)
+    p.add_argument("--batch-end", type=int, default=None)
+    p.add_argument("--limit", type=int, default=None)
     p.add_argument("--reset-running", action="store_true")
-    p.add_argument("--count-rows", action="store_true")
+
+    # perf + http
     p.add_argument("--max-rps", type=float, default=4.0)
     p.add_argument("--timeout", type=int, default=60)
-    p.add_argument("--threads", type=int, default=8)
-    p.add_argument("--memory-limit", type=str, default="8GB")
+    p.add_argument("--threads", type=int, default=4)
+    p.add_argument("--memory-limit", type=str, default="2GB")
     p.add_argument("--log-level", type=str, default="INFO")
+
+    # paths (override config for EC2)
+    p.add_argument(
+        "--db-path",
+        type=str,
+        required=True,
+        help="Path to worker-local DuckDB file",
+    )
+    p.add_argument(
+        "--out-dir",
+        type=str,
+        required=True,
+        help="Local output dir for parquet staging",
+    )
+    p.add_argument(
+        "--log-dir",
+        type=str,
+        required=True,
+        help="Local log dir",
+    )
+
+    # S3 upload
+    p.add_argument("--s3-bucket", type=str, default=os.getenv("S3_BUCKET"))
+    p.add_argument(
+        "--s3-prefix", type=str, default=os.getenv("S3_PREFIX", "candlesticks_raw/")
+    )
+    p.add_argument(
+        "--s3-region",
+        type=str,
+        default=os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION"),
+    )
+    p.add_argument(
+        "--delete-local",
+        action="store_true",
+        help="Delete parquet after successful S3 upload",
+    )
+
     return p.parse_args()
 
 
 # ============================================================
-# CONFIG
+# CONFIG RESOLUTION
 # ============================================================
 
-CFG = load_config()
-PATHS = CFG.paths
 
-DB_PATH = Path(PATHS["duckdb_dir"]) / "kalshi.duckdb"
-PARQUET_OUT = Path(PATHS["parquet_data_dir"]) / "candlesticks_raw"
-LOG_DIR = Path(PATHS["log_dir"])
+@dataclass(frozen=True)
+class Paths:
+    db_path: Path
+    out_dir: Path
+    log_dir: Path
 
-PARQUET_OUT.mkdir(parents=True, exist_ok=True)
-LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+def resolve_paths(args: argparse.Namespace) -> Paths:
+    if not args.db_path:
+        raise SystemExit("--db-path is required on EC2")
+    if not args.out_dir:
+        raise SystemExit("--out-dir is required on EC2")
+    if not args.log_dir:
+        raise SystemExit("--log-dir is required on EC2")
+
+    db_path = Path(args.db_path)
+    out_dir = Path(args.out_dir)
+    log_dir = Path(args.log_dir)
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    return Paths(
+        db_path=db_path,
+        out_dir=out_dir,
+        log_dir=log_dir,
+    )
 
 
 # ============================================================
@@ -74,9 +136,9 @@ LOG_DIR.mkdir(parents=True, exist_ok=True)
 # ============================================================
 
 
-def setup_logging(level: str) -> logging.Logger:
+def setup_logging(log_dir: Path, level: str) -> logging.Logger:
     log_file = (
-        LOG_DIR
+        log_dir
         / f"candlestick_batches_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.log"
     )
     logging.basicConfig(
@@ -95,20 +157,25 @@ def setup_logging(level: str) -> logging.Logger:
 class RateLimiter:
     def __init__(self, max_rps: float):
         self.interval = 1.0 / max(max_rps, 0.01)
-        self.last = 0.0
+        self.next_ts = time.monotonic()
 
     def wait(self):
         now = time.monotonic()
-        delay = self.interval - (now - self.last)
-        if delay > 0:
-            time.sleep(delay)
-        self.last = time.monotonic()
+        if now < self.next_ts:
+            time.sleep(self.next_ts - now)
+        # schedule next slot (avoid drift if calls run slow)
+        self.next_ts = max(self.next_ts + self.interval, time.monotonic())
 
 
-def _sleep_backoff(attempt: int, retry_after: Optional[float] = None):
+def _sleep_backoff(attempt: int, retry_after: Optional[str] = None):
     if retry_after:
-        time.sleep(min(retry_after, MAX_BACKOFF_S))
-        return
+        try:
+            ra = float(retry_after)
+            time.sleep(min(ra, MAX_BACKOFF_S))
+            return
+        except ValueError:
+            pass
+
     backoff = min(BASE_BACKOFF_S * (2**attempt), MAX_BACKOFF_S)
     time.sleep(backoff + random.uniform(0, backoff * 0.25))
 
@@ -145,6 +212,39 @@ def fetch_json(url: str, *, timeout: int, limiter: RateLimiter) -> Dict[str, Any
 
 
 # ============================================================
+# S3 UPLOAD
+# ============================================================
+
+
+def s3_client(region: Optional[str]):
+    if region:
+        return boto3.client("s3", region_name=region)
+    return boto3.client("s3")
+
+
+def upload_to_s3(
+    *,
+    client,
+    local_path: Path,
+    bucket: str,
+    key: str,
+    log: logging.Logger,
+) -> str:
+    """
+    Uploads local_path -> s3://bucket/key, returns s3 URI.
+    Uses managed multipart for large files (upload_file).
+    """
+    try:
+        client.upload_file(str(local_path), bucket, key)
+    except (BotoCoreError, ClientError) as e:
+        raise RuntimeError(f"S3 upload failed: {e}") from e
+
+    uri = f"s3://{bucket}/{key}"
+    log.info(f"Uploaded {local_path.name} -> {uri}")
+    return uri
+
+
+# ============================================================
 # DUCKDB HELPERS
 # ============================================================
 
@@ -175,9 +275,9 @@ def ensure_schema(con: duckdb.DuckDBPyConnection):
 
 
 def reset_running(con):
-    con.execute(
+    return con.execute(
         "UPDATE candlestick_job_batches SET status='pending' WHERE status='running'"
-    )
+    ).rowcount
 
 
 def claim_batch(con, start: Optional[int], end: Optional[int]):
@@ -319,15 +419,23 @@ def write_parquet(con, response: dict, out_file: Path) -> int:
 
 def main():
     args = parse_args()
-    log = setup_logging(args.log_level)
+    paths = resolve_paths(args)
+    log = setup_logging(paths.log_dir, args.log_level)
 
-    # If user provides only one side of range, treat as "no range"
+    # If user provides only one side of range, treat as invalid
     if (args.batch_start is None) ^ (args.batch_end is None):
         raise SystemExit("Provide BOTH --batch-start and --batch-end, or neither.")
 
     limiter = RateLimiter(args.max_rps)
-    con = duckdb.connect(str(DB_PATH))
 
+    # S3 is optional for local runs, required for EC2 benchmark runs (recommended)
+    if not args.s3_bucket:
+        raise SystemExit("--s3-bucket is required for EC2 runs")
+
+    s3 = s3_client(args.s3_region)
+    do_s3 = True
+
+    con = duckdb.connect(str(paths.db_path))
     try:
         con.execute(f"PRAGMA threads={int(args.threads)};")
     except Exception:
@@ -340,11 +448,11 @@ def main():
     ensure_schema(con)
 
     if args.reset_running:
-        reset_running(con)
-        log.warning("Reset running -> pending")
+        n = reset_running(con)
+        log.warning(f"Reset running -> pending: {n} rows")
 
     completed = 0
-    start = perf_counter()
+    start_t = perf_counter()
 
     while True:
         if args.limit is not None and completed >= args.limit:
@@ -358,6 +466,7 @@ def main():
         url = str(batch["url"])
         log.info(f"START batch_id={batch_id}")
 
+        out_local: Optional[Path] = None
         try:
             data = fetch_json(url, timeout=args.timeout, limiter=limiter)
 
@@ -367,12 +476,45 @@ def main():
             markets = data.get("markets") or []
             has_candles = any((m.get("candlesticks") or []) for m in markets)
 
-            out = (
-                PARQUET_OUT / f"candles_batch{batch_id:09d}_{uuid.uuid4().hex}.parquet"
-            )
             rows = 0
+            output_ref: Optional[str] = None
+
             if has_candles:
-                rows = write_parquet(con, data, out)
+                out_local = (
+                    paths.out_dir
+                    / f"candles_batch{batch_id:09d}_{uuid.uuid4().hex}.parquet"
+                )
+                rows = write_parquet(con, data, out_local)
+
+                if do_s3:
+                    # key scheme: prefix/YYYY/MM/DD/batch_id=.../file.parquet (nice for Athena later)
+                    dt = datetime.now(timezone.utc)
+                    prefix = args.s3_prefix.lstrip("/")
+                    if prefix and not prefix.endswith("/"):
+                        prefix += "/"
+                    key = (
+                        f"{prefix}{dt:%Y/%m/%d}/"
+                        f"batch_id={batch_id:09d}/"
+                        f"{out_local.name}"
+                    )
+                    output_ref = upload_to_s3(
+                        client=s3,
+                        local_path=out_local,
+                        bucket=args.s3_bucket,
+                        key=key,
+                        log=log,
+                    )
+
+                    if args.delete_local:
+                        out_local.unlink(missing_ok=True)
+                        out_local = None
+                else:
+                    output_ref = str(out_local)
+
+            else:
+                # no candles → completed with rows=0 and output_file NULL
+                rows = 0
+                output_ref = None
 
             mark_batch(
                 con,
@@ -380,7 +522,7 @@ def main():
                 status="completed",
                 error=None,
                 rows=rows,
-                out_file=str(out),
+                output_file=output_ref,
             )
             log.info(f"SUCCESS batch_id={batch_id} rows={rows}")
 
@@ -392,16 +534,15 @@ def main():
                 status="failed",
                 error=str(e)[:4000],
                 rows=0,
-                out_file=None,
+                output_file=None,
             )
 
         completed += 1
 
-    elapsed = perf_counter() - start
+    elapsed = perf_counter() - start_t
     log.info(f"Done {completed} batches in {elapsed / 60:.1f} min")
     con.close()
 
 
 if __name__ == "__main__":
     main()
-
