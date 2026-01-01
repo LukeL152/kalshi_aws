@@ -522,7 +522,7 @@ def main():
                 status="completed",
                 error=None,
                 rows=rows,
-                output_file=output_ref,
+                out_file=output_ref,
             )
             log.info(f"SUCCESS batch_id={batch_id} rows={rows}")
 
@@ -534,7 +534,7 @@ def main():
                 status="failed",
                 error=str(e)[:4000],
                 rows=0,
-                output_file=None,
+                out_file=None,
             )
 
         completed += 1
