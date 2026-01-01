@@ -1,4 +1,3 @@
-# /ingest_jobs_ec2.py
 from __future__ import annotations
 
 import argparse
@@ -16,9 +15,8 @@ from typing import Optional, Dict, Any
 
 import duckdb
 import requests
-
 import boto3
-from botocore.exceptions import BotoCoreError, ClientError
+from botocore.exceptions import ClientError, BotoCoreError
 
 # ============================================================
 # CONSTANTS (API semantics)
@@ -31,7 +29,7 @@ BASE_BACKOFF_S = 0.5
 MAX_BACKOFF_S = 20.0
 
 BASE_HEADERS = {
-    "User-Agent": "kalshi-candlestick-batch-worker/1.0",
+    "User-Agent": "kalshi-candlestick-shard-worker/1.0",
     "Accept": "application/json",
 }
 
@@ -42,63 +40,39 @@ BASE_HEADERS = {
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Kalshi candlestick batch worker (claims from DuckDB, calls batch URL, writes parquet, uploads to S3)."
+        description="Kalshi candlestick shard worker (claims shard DB from S3, runs batches, uploads parquet to S3)."
     )
 
-    # job selection
-    p.add_argument("--batch-start", type=int, default=None)
-    p.add_argument("--batch-end", type=int, default=None)
-    p.add_argument("--limit", type=int, default=None)
-    p.add_argument("--reset-running", action="store_true")
+    # shard source
+    p.add_argument("--shard-bucket", required=True)
+    p.add_argument("--shard-prefix", required=True, help="e.g. shards/test")
+
+    # parquet destination
+    p.add_argument("--s3-bucket", required=True)
+    p.add_argument(
+        "--s3-prefix", default="candlesticks_raw", help="e.g. candlesticks_raw"
+    )
+
+    # local staging
+    p.add_argument("--out-dir", required=True)
+    p.add_argument("--log-dir", required=True)
 
     # perf + http
     p.add_argument("--max-rps", type=float, default=4.0)
     p.add_argument("--timeout", type=int, default=60)
-    p.add_argument("--threads", type=int, default=4)
-    p.add_argument("--memory-limit", type=str, default="2GB")
+    p.add_argument("--threads", type=int, default=1)
+    p.add_argument("--memory-limit", type=str, default="512MB")
+    p.add_argument("--delete-local", action="store_true")
     p.add_argument("--log-level", type=str, default="INFO")
 
-    # paths (override config for EC2)
-    p.add_argument(
-        "--db-path",
-        type=str,
-        required=True,
-        help="Path to worker-local DuckDB file",
-    )
-    p.add_argument(
-        "--out-dir",
-        type=str,
-        required=True,
-        help="Local output dir for parquet staging",
-    )
-    p.add_argument(
-        "--log-dir",
-        type=str,
-        required=True,
-        help="Local log dir",
-    )
-
-    # S3 upload
-    p.add_argument("--s3-bucket", type=str, default=os.getenv("S3_BUCKET"))
-    p.add_argument(
-        "--s3-prefix", type=str, default=os.getenv("S3_PREFIX", "candlesticks_raw/")
-    )
-    p.add_argument(
-        "--s3-region",
-        type=str,
-        default=os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION"),
-    )
-    p.add_argument(
-        "--delete-local",
-        action="store_true",
-        help="Delete parquet after successful S3 upload",
-    )
+    # optional: limit batches per shard (useful for testing)
+    p.add_argument("--limit", type=int, default=None)
 
     return p.parse_args()
 
 
 # ============================================================
-# CONFIG RESOLUTION
+# PATHS + LOGGING
 # ============================================================
 
 
@@ -110,61 +84,43 @@ class Paths:
 
 
 def resolve_paths(args: argparse.Namespace) -> Paths:
-    if not args.db_path:
-        raise SystemExit("--db-path is required on EC2")
-    if not args.out_dir:
-        raise SystemExit("--out-dir is required on EC2")
-    if not args.log_dir:
-        raise SystemExit("--log-dir is required on EC2")
-
-    db_path = Path(args.db_path)
     out_dir = Path(args.out_dir)
     log_dir = Path(args.log_dir)
-
     out_dir.mkdir(parents=True, exist_ok=True)
     log_dir.mkdir(parents=True, exist_ok=True)
-
     return Paths(
-        db_path=db_path,
+        db_path=Path("/tmp/jobs.duckdb"),
         out_dir=out_dir,
         log_dir=log_dir,
     )
 
 
-# ============================================================
-# LOGGING
-# ============================================================
-
-
 def setup_logging(log_dir: Path, level: str) -> logging.Logger:
-    log_file = (
-        log_dir
-        / f"candlestick_batches_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.log"
-    )
+    log_file = log_dir / f"shard_worker_{datetime.now(timezone.utc):%Y%m%d_%H%M%S}.log"
     logging.basicConfig(
         level=getattr(logging, level.upper(), logging.INFO),
         format="%(asctime)s | %(levelname)s | %(message)s",
         handlers=[logging.FileHandler(log_file), logging.StreamHandler()],
     )
-    return logging.getLogger("candlestick_batches")
+    return logging.getLogger("shard_worker")
 
 
 # ============================================================
-# RATE LIMITER
+# RATE LIMITER + HTTP
 # ============================================================
 
 
 class RateLimiter:
     def __init__(self, max_rps: float):
         self.interval = 1.0 / max(max_rps, 0.01)
-        self.next_ts = time.monotonic()
+        self.last = 0.0
 
     def wait(self):
         now = time.monotonic()
-        if now < self.next_ts:
-            time.sleep(self.next_ts - now)
-        # schedule next slot (avoid drift if calls run slow)
-        self.next_ts = max(self.next_ts + self.interval, time.monotonic())
+        delay = self.interval - (now - self.last)
+        if delay > 0:
+            time.sleep(delay)
+        self.last = time.monotonic()
 
 
 def _sleep_backoff(attempt: int, retry_after: Optional[str] = None):
@@ -175,7 +131,6 @@ def _sleep_backoff(attempt: int, retry_after: Optional[str] = None):
             return
         except ValueError:
             pass
-
     backoff = min(BASE_BACKOFF_S * (2**attempt), MAX_BACKOFF_S)
     time.sleep(backoff + random.uniform(0, backoff * 0.25))
 
@@ -212,44 +167,12 @@ def fetch_json(url: str, *, timeout: int, limiter: RateLimiter) -> Dict[str, Any
 
 
 # ============================================================
-# S3 UPLOAD
-# ============================================================
-
-
-def s3_client(region: Optional[str]):
-    if region:
-        return boto3.client("s3", region_name=region)
-    return boto3.client("s3")
-
-
-def upload_to_s3(
-    *,
-    client,
-    local_path: Path,
-    bucket: str,
-    key: str,
-    log: logging.Logger,
-) -> str:
-    """
-    Uploads local_path -> s3://bucket/key, returns s3 URI.
-    Uses managed multipart for large files (upload_file).
-    """
-    try:
-        client.upload_file(str(local_path), bucket, key)
-    except (BotoCoreError, ClientError) as e:
-        raise RuntimeError(f"S3 upload failed: {e}") from e
-
-    uri = f"s3://{bucket}/{key}"
-    log.info(f"Uploaded {local_path.name} -> {uri}")
-    return uri
-
-
-# ============================================================
-# DUCKDB HELPERS
+# DUCKDB HELPERS (same as local)
 # ============================================================
 
 
 def ensure_schema(con: duckdb.DuckDBPyConnection):
+    # shards should already have this table, but keep safety
     con.execute("""
         CREATE TABLE IF NOT EXISTS candlestick_job_batches (
             batch_id BIGINT PRIMARY KEY,
@@ -274,43 +197,22 @@ def ensure_schema(con: duckdb.DuckDBPyConnection):
     """)
 
 
-def reset_running(con):
-    return con.execute(
-        "UPDATE candlestick_job_batches SET status='pending' WHERE status='running'"
-    ).rowcount
-
-
-def claim_batch(con, start: Optional[int], end: Optional[int]):
-    if start is not None and end is not None:
-        q = """
-        UPDATE candlestick_job_batches
-        SET status='running', last_attempt_ts=CURRENT_TIMESTAMP,
-            attempt_count=attempt_count+1, error_message=NULL
-        WHERE batch_id = (
-            SELECT batch_id FROM candlestick_job_batches
-            WHERE status='pending' AND batch_id BETWEEN ? AND ?
-            ORDER BY batch_id LIMIT 1
-        )
-        RETURNING *
-        """
-        row = con.execute(q, (start, end)).fetchone()
-    else:
-        q = """
-        UPDATE candlestick_job_batches
-        SET status='running', last_attempt_ts=CURRENT_TIMESTAMP,
-            attempt_count=attempt_count+1, error_message=NULL
-        WHERE batch_id = (
-            SELECT batch_id FROM candlestick_job_batches
-            WHERE status='pending'
-            ORDER BY batch_id LIMIT 1
-        )
-        RETURNING *
-        """
-        row = con.execute(q).fetchone()
-
+def claim_batch(con):
+    q = """
+    UPDATE candlestick_job_batches
+    SET status='running', last_attempt_ts=CURRENT_TIMESTAMP,
+        attempt_count=attempt_count+1, error_message=NULL
+    WHERE batch_id = (
+        SELECT batch_id FROM candlestick_job_batches
+        WHERE status='pending'
+        ORDER BY batch_id
+        LIMIT 1
+    )
+    RETURNING *
+    """
+    row = con.execute(q).fetchone()
     if not row:
         return None
-
     cols = [c[0] for c in con.execute("DESCRIBE candlestick_job_batches").fetchall()]
     return dict(zip(cols, row))
 
@@ -336,24 +238,13 @@ def mark_batch(
 
 
 # ============================================================
-# JSON → PARQUET
+# JSON → PARQUET (same as local)
 # ============================================================
 
 
 def write_parquet(con, response: dict, out_file: Path) -> int:
     tmp = out_file.with_suffix(".json")
     tmp.write_text(json.dumps(response), encoding="utf-8")
-
-    def dollars(struct, dollars_key, cents_key):
-        return f"""
-        CASE
-          WHEN struct_extract({struct}, '{dollars_key}') IS NOT NULL
-            THEN try_cast(struct_extract({struct}, '{dollars_key}') AS DOUBLE)
-          WHEN struct_extract({struct}, '{cents_key}') IS NOT NULL
-            THEN try_cast(struct_extract({struct}, '{cents_key}') AS DOUBLE) / 100.0
-          ELSE NULL
-        END
-        """
 
     sql = f"""
     COPY (
@@ -378,7 +269,6 @@ def write_parquet(con, response: dict, out_file: Path) -> int:
             try_cast(candle.open_interest AS BIGINT) AS open_interest,
             try_cast(candle.volume AS BIGINT) AS volume,
 
-            -- PRICE (JSON-safe)
             json_extract_string(candle.price, '$.open_dollars')     AS price_open_dollars,
             json_extract_string(candle.price, '$.close_dollars')    AS price_close_dollars,
             json_extract_string(candle.price, '$.high_dollars')     AS price_high_dollars,
@@ -386,13 +276,11 @@ def write_parquet(con, response: dict, out_file: Path) -> int:
             json_extract_string(candle.price, '$.mean_dollars')     AS price_mean_dollars,
             json_extract_string(candle.price, '$.previous_dollars') AS price_previous_dollars,
 
-            -- YES BID
             json_extract_string(candle.yes_bid, '$.open_dollars')   AS yes_bid_open_dollars,
             json_extract_string(candle.yes_bid, '$.close_dollars')  AS yes_bid_close_dollars,
             json_extract_string(candle.yes_bid, '$.high_dollars')   AS yes_bid_high_dollars,
             json_extract_string(candle.yes_bid, '$.low_dollars')    AS yes_bid_low_dollars,
 
-            -- YES ASK
             json_extract_string(candle.yes_ask, '$.open_dollars')   AS yes_ask_open_dollars,
             json_extract_string(candle.yes_ask, '$.close_dollars')  AS yes_ask_close_dollars,
             json_extract_string(candle.yes_ask, '$.high_dollars')   AS yes_ask_high_dollars,
@@ -413,6 +301,85 @@ def write_parquet(con, response: dict, out_file: Path) -> int:
 
 
 # ============================================================
+# S3 SHARD CLAIMING
+# ============================================================
+
+
+def s3_client():
+    # region is usually injected on EC2 via instance metadata / env; keep simple
+    return boto3.client("s3")
+
+
+def _norm_prefix(p: str) -> str:
+    return p.strip("/")
+
+
+def claim_shard(s3, bucket: str, prefix: str, log: logging.Logger) -> Optional[str]:
+    """
+    Best-effort claim:
+      - list 1 pending object
+      - copy -> running/
+      - delete pending
+    Note: not perfectly atomic, but OK if contention is low; can harden later with lock objects.
+    """
+    prefix = _norm_prefix(prefix)
+    pending_prefix = f"{prefix}/pending/"
+    running_prefix = f"{prefix}/running/"
+
+    resp = s3.list_objects_v2(Bucket=bucket, Prefix=pending_prefix, MaxKeys=1)
+    items = resp.get("Contents", [])
+    if not items:
+        return None
+
+    key = items[0]["Key"]
+    shard_name = key.split("/")[-1]
+    dest_key = f"{running_prefix}{shard_name}"
+
+    try:
+        s3.copy_object(
+            Bucket=bucket,
+            CopySource={"Bucket": bucket, "Key": key},
+            Key=dest_key,
+        )
+        s3.delete_object(Bucket=bucket, Key=key)
+        log.info(f"CLAIM shard={shard_name}")
+        return shard_name
+    except ClientError as e:
+        log.warning(f"Claim failed (race?): {e}")
+        return None
+
+
+def finalize_shard(
+    s3,
+    bucket: str,
+    prefix: str,
+    shard_name: str,
+    status: str,
+    local_db: Path,
+    log: logging.Logger,
+):
+    prefix = _norm_prefix(prefix)
+    key = f"{prefix}/{status}/{shard_name}"
+    s3.upload_file(str(local_db), bucket, key)
+    log.info(f"UPLOAD shard_db -> s3://{bucket}/{key}")
+
+
+# ============================================================
+# S3 PARQUET UPLOAD
+# ============================================================
+
+
+def upload_parquet(
+    s3, bucket: str, prefix: str, batch_id: int, local_path: Path
+) -> str:
+    prefix = _norm_prefix(prefix)
+    dt = datetime.now(timezone.utc)
+    key = f"{prefix}/{dt:%Y/%m/%d}/batch_id={batch_id:09d}/{local_path.name}"
+    s3.upload_file(str(local_path), bucket, key)
+    return f"s3://{bucket}/{key}"
+
+
+# ============================================================
 # MAIN
 # ============================================================
 
@@ -422,18 +389,16 @@ def main():
     paths = resolve_paths(args)
     log = setup_logging(paths.log_dir, args.log_level)
 
-    # If user provides only one side of range, treat as invalid
-    if (args.batch_start is None) ^ (args.batch_end is None):
-        raise SystemExit("Provide BOTH --batch-start and --batch-end, or neither.")
+    s3 = s3_client()
 
-    limiter = RateLimiter(args.max_rps)
+    shard_name = claim_shard(s3, args.shard_bucket, args.shard_prefix, log)
+    if not shard_name:
+        log.info("No shards available; exiting.")
+        return
 
-    # S3 is optional for local runs, required for EC2 benchmark runs (recommended)
-    if not args.s3_bucket:
-        raise SystemExit("--s3-bucket is required for EC2 runs")
-
-    s3 = s3_client(args.s3_region)
-    do_s3 = True
+    running_key = f"{_norm_prefix(args.shard_prefix)}/running/{shard_name}"
+    log.info(f"DOWNLOAD shard_db <- s3://{args.shard_bucket}/{running_key}")
+    s3.download_file(args.shard_bucket, running_key, str(paths.db_path))
 
     con = duckdb.connect(str(paths.db_path))
     try:
@@ -446,19 +411,18 @@ def main():
         pass
 
     ensure_schema(con)
-
-    if args.reset_running:
-        n = reset_running(con)
-        log.warning(f"Reset running -> pending: {n} rows")
+    limiter = RateLimiter(args.max_rps)
 
     completed = 0
-    start_t = perf_counter()
+    start = perf_counter()
+
+    shard_failed = False
 
     while True:
         if args.limit is not None and completed >= args.limit:
             break
 
-        batch = claim_batch(con, args.batch_start, args.batch_end)
+        batch = claim_batch(con)
         if not batch:
             break
 
@@ -477,7 +441,7 @@ def main():
             has_candles = any((m.get("candlesticks") or []) for m in markets)
 
             rows = 0
-            output_ref: Optional[str] = None
+            out_ref: Optional[str] = None
 
             if has_candles:
                 out_local = (
@@ -485,36 +449,13 @@ def main():
                     / f"candles_batch{batch_id:09d}_{uuid.uuid4().hex}.parquet"
                 )
                 rows = write_parquet(con, data, out_local)
+                out_ref = upload_parquet(
+                    s3, args.s3_bucket, args.s3_prefix, batch_id, out_local
+                )
 
-                if do_s3:
-                    # key scheme: prefix/YYYY/MM/DD/batch_id=.../file.parquet (nice for Athena later)
-                    dt = datetime.now(timezone.utc)
-                    prefix = args.s3_prefix.lstrip("/")
-                    if prefix and not prefix.endswith("/"):
-                        prefix += "/"
-                    key = (
-                        f"{prefix}{dt:%Y/%m/%d}/"
-                        f"batch_id={batch_id:09d}/"
-                        f"{out_local.name}"
-                    )
-                    output_ref = upload_to_s3(
-                        client=s3,
-                        local_path=out_local,
-                        bucket=args.s3_bucket,
-                        key=key,
-                        log=log,
-                    )
-
-                    if args.delete_local:
-                        out_local.unlink(missing_ok=True)
-                        out_local = None
-                else:
-                    output_ref = str(out_local)
-
-            else:
-                # no candles → completed with rows=0 and output_file NULL
-                rows = 0
-                output_ref = None
+                if args.delete_local:
+                    out_local.unlink(missing_ok=True)
+                    out_local = None
 
             mark_batch(
                 con,
@@ -522,7 +463,7 @@ def main():
                 status="completed",
                 error=None,
                 rows=rows,
-                out_file=output_ref,
+                out_file=out_ref,
             )
             log.info(f"SUCCESS batch_id={batch_id} rows={rows}")
 
@@ -536,13 +477,34 @@ def main():
                 rows=0,
                 out_file=None,
             )
+            # keep going; shard can still complete remaining batches
 
         completed += 1
 
-    elapsed = perf_counter() - start_t
-    log.info(f"Done {completed} batches in {elapsed / 60:.1f} min")
+    elapsed = perf_counter() - start
+    log.info(f"DONE shard={shard_name} batches={completed} elapsed_s={elapsed:.1f}")
+
+    # Upload updated shard DB as completed
+    try:
+        finalize_shard(
+            s3,
+            args.shard_bucket,
+            args.shard_prefix,
+            shard_name,
+            "completed",
+            paths.db_path,
+            log,
+        )
+    except (BotoCoreError, ClientError) as e:
+        shard_failed = True
+        log.error(f"Failed to upload completed shard DB: {e}")
+
     con.close()
+
+    if shard_failed:
+        raise SystemExit(2)
 
 
 if __name__ == "__main__":
     main()
+
