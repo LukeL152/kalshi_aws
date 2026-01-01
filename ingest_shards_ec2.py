@@ -411,7 +411,13 @@ def main():
 
     s3 = s3_client()
 
-    shard_name = claim_shard(s3, args.shard_bucket, args.shard_prefix, log)
+    shard_name = claim_shard(
+        s3,
+        bucket=args.shard_bucket,
+        prefix=args.shard_prefix,
+        log=log,
+    )
+
     if not shard_name:
         log.info("No shards available; exiting.")
         return
