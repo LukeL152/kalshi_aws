@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import logging
 import random
 import time
@@ -65,7 +66,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--log-level", type=str, default="INFO")
 
     # optional: limit batches per shard (useful for testing)
-    p.add_argument("--limit", type=int, default=None)
+    p.add_argument("--batch-limit", type=int, default=None)
+
+    # optional: limit shards per worker (useful for testing)
+    p.add_argument(
+        "--shard-limit",
+        type=int,
+        default=None,
+        help="Max number of shards to process in this worker run",
+    )
 
     return p.parse_args()
 
@@ -306,7 +315,7 @@ def write_parquet(con, response: dict, out_file: Path) -> int:
 
 def s3_client():
     # region is usually injected on EC2 via instance metadata / env; keep simple
-    return boto3.client("s3")
+    return boto3.client("s3", region_name="us-east-1")
 
 
 def _norm_prefix(p: str) -> str:
@@ -353,7 +362,7 @@ def claim_shard(
             Bucket=bucket,
             Key=dst_key,
             CopySource={"Bucket": bucket, "Key": src_key},
-            CopySourceIfNoneMatch="*",  # 🔐 atomic lock
+            IfNoneMatch="*",  # 🔐 atomic lock
         )
     except ClientError as e:
         code = e.response["Error"]["Code"]
@@ -387,6 +396,27 @@ def finalize_shard(
 # ============================================================
 # S3 PARQUET UPLOAD
 # ============================================================
+def debug_list_s3(s3, bucket: str, prefix: str, log: logging.Logger):
+    log.warning("=== S3 DEBUG LIST ===")
+    log.warning(f"Bucket = {bucket}")
+    log.warning(f"Prefix = {prefix}")
+
+    resp = s3.list_objects_v2(
+        Bucket=bucket,
+        Prefix=prefix,
+        MaxKeys=10,
+    )
+
+    log.warning("Raw response:")
+    log.warning(json.dumps(resp, default=str, indent=2))
+
+    contents = resp.get("Contents", [])
+    log.warning(f"Found {len(contents)} objects")
+
+    for obj in contents:
+        log.warning(f" - {obj['Key']}  size={obj['Size']}")
+
+    log.warning("=== END S3 DEBUG ===")
 
 
 def upload_parquet(
@@ -399,29 +429,14 @@ def upload_parquet(
     return f"s3://{bucket}/{key}"
 
 
-# ============================================================
-# MAIN
-# ============================================================
-
-
-def main():
-    args = parse_args()
-    paths = resolve_paths(args)
-    log = setup_logging(paths.log_dir, args.log_level)
-
-    s3 = s3_client()
-
-    shard_name = claim_shard(
-        s3,
-        bucket=args.shard_bucket,
-        prefix=args.shard_prefix,
-        log=log,
-    )
-
-    if not shard_name:
-        log.info("No shards available; exiting.")
-        return
-
+def process_one_shard(
+    *,
+    s3,
+    args,
+    paths: Paths,
+    shard_name: str,
+    log: logging.Logger,
+):
     running_key = f"{_norm_prefix(args.shard_prefix)}/running/{shard_name}"
     log.info(f"DOWNLOAD shard_db <- s3://{args.shard_bucket}/{running_key}")
     s3.download_file(args.shard_bucket, running_key, str(paths.db_path))
@@ -441,11 +456,10 @@ def main():
 
     completed = 0
     start = perf_counter()
-
     shard_failed = False
 
     while True:
-        if args.limit is not None and completed >= args.limit:
+        if args.batch_limit is not None and completed >= args.batch_limit:
             break
 
         batch = claim_batch(con)
@@ -503,14 +517,12 @@ def main():
                 rows=0,
                 out_file=None,
             )
-            # keep going; shard can still complete remaining batches
 
         completed += 1
 
     elapsed = perf_counter() - start
     log.info(f"DONE shard={shard_name} batches={completed} elapsed_s={elapsed:.1f}")
 
-    # Upload updated shard DB as completed
     try:
         finalize_shard(
             s3,
@@ -529,6 +541,57 @@ def main():
 
     if shard_failed:
         raise SystemExit(2)
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+
+def main():
+    args = parse_args()
+    paths = resolve_paths(args)
+    log = setup_logging(paths.log_dir, args.log_level)
+
+    log.info(
+        f"Worker starting (shard_limit={args.shard_limit}, batch_limit={args.batch_limit})"
+    )
+
+    s3 = s3_client()
+
+    shards_processed = 0
+
+    while True:
+        if args.shard_limit is not None and shards_processed >= args.shard_limit:
+            log.info(f"Shard limit reached ({args.shard_limit}); exiting worker.")
+            break
+
+        shard_name = claim_shard(
+            s3,
+            bucket=args.shard_bucket,
+            prefix=args.shard_prefix,
+            log=log,
+        )
+
+        if not shard_name:
+            if shards_processed == 0:
+                log.info("No shards available; exiting.")
+            else:
+                log.info(
+                    f"No more shards available; processed {shards_processed} shard(s)."
+                )
+            break
+
+        shards_processed += 1
+        log.info(f"PROCESSING shard #{shards_processed}: {shard_name}")
+
+        process_one_shard(
+            s3=s3,
+            args=args,
+            paths=paths,
+            shard_name=shard_name,
+            log=log,
+        )
 
 
 if __name__ == "__main__":
