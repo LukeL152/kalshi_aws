@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "s3-shard-ingest-worker"
+version = "0.1.0"
+description = "Reusable Python worker for distributed ingest using S3-coordinated shard databases."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "boto3",
+  "duckdb",
+  "requests",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

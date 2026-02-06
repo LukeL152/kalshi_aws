@@ -1,0 +1,118 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+LOG_DIR="/home/ec2-user/${project_name}_logs"
+mkdir -p "$LOG_DIR"
+MASTER_LOG="$LOG_DIR/user_data.log"
+exec >>"$MASTER_LOG" 2>&1
+set -x
+
+TOKEN="$(curl -sS -X PUT "http://169.254.169.254/latest/api/token" \
+  -H "X-aws-ec2-metadata-token-ttl-seconds: 21600" || true)"
+
+INSTANCE_ID="$(curl -sS -H "X-aws-ec2-metadata-token: $TOKEN" \
+  http://169.254.169.254/latest/meta-data/instance-id || true)"
+
+REGION="$(curl -sS -H "X-aws-ec2-metadata-token: $TOKEN" \
+  http://169.254.169.254/latest/meta-data/placement/region 2>/dev/null || true)"
+
+if [ -z "$REGION" ]; then
+  AZ="$(curl -sS -H "X-aws-ec2-metadata-token: $TOKEN" \
+    http://169.254.169.254/latest/meta-data/placement/availability-zone || true)"
+  REGION="$(echo "$AZ" | sed 's/.$//')"
+fi
+
+if [ -z "$REGION" ]; then
+  REGION="${region}"
+fi
+
+DATE_UTC="$(date -u +"%Y-%m-%dT%H-%M-%S")"
+
+S3_BUCKET="${s3_bucket}"
+SHARD_PREFIX="${shard_prefix}"
+S3_PREFIX="${s3_prefix}"
+WORKER_LOG_PREFIX="${worker_log_prefix}"
+
+REPO_URL="${repo_url}"
+REPO_REF="${repo_ref}"
+REPO_DIR="/home/ec2-user/ingest_worker_repo"
+
+OUT_DIR="/tmp/parquet"
+WORKER_LOG="$LOG_DIR/worker.log"
+
+MAX_RPS="${max_rps}"
+THREADS="${threads}"
+MEMORY_LIMIT="${memory_limit}"
+
+finalize() {
+  set +e
+  command -v aws >/dev/null 2>&1 || return 0
+
+  for i in {1..60}; do
+    aws sts get-caller-identity --region "$REGION" >/dev/null 2>&1 && break
+    sleep 2
+  done
+
+  aws s3 sync "$LOG_DIR" \
+    "s3://$S3_BUCKET/$WORKER_LOG_PREFIX/$DATE_UTC/$INSTANCE_ID/" \
+    --region "$REGION" || true
+
+  sudo shutdown -h now || true
+}
+
+trap finalize EXIT
+
+sudo dnf install -y \
+  awscli \
+  git \
+  python3 \
+  python3-pip \
+  gcc \
+  gcc-c++ \
+  make \
+  libffi-devel \
+  openssl-devel
+
+rm -rf "$REPO_DIR"
+git clone "$REPO_URL" "$REPO_DIR"
+cd "$REPO_DIR"
+git fetch --all --tags
+git checkout "$REPO_REF"
+
+python3 -m venv venv
+source venv/bin/activate
+python3 -m pip install --upgrade pip setuptools wheel
+
+if [ -f "pyproject.toml" ]; then
+  python3 -m pip install -e .
+elif [ -f "requirements.txt" ]; then
+  python3 -m pip install -r requirements.txt
+fi
+
+mkdir -p "$OUT_DIR" "$LOG_DIR"
+
+for i in {1..60}; do
+  aws sts get-caller-identity --region "$REGION" >/dev/null 2>&1 && break
+  sleep 2
+done
+
+set +e
+python3 -m ingest_shards_ec2 \
+  --shard-bucket "$S3_BUCKET" \
+  --shard-prefix "$SHARD_PREFIX" \
+  --s3-bucket "$S3_BUCKET" \
+  --s3-prefix "$S3_PREFIX" \
+  --out-dir "$OUT_DIR" \
+  --log-dir "$LOG_DIR" \
+  --aws-region "$REGION" \
+  --max-rps "$MAX_RPS" \
+  --threads "$THREADS" \
+  --memory-limit "$MEMORY_LIMIT" \
+  --delete-local \
+  > "$WORKER_LOG" 2>&1
+
+WORKER_EXIT_CODE=$?
+echo "worker_exit_code=$WORKER_EXIT_CODE" | tee -a "$LOG_DIR/worker_exit_code.log"
+
+sync
+exit "$WORKER_EXIT_CODE"

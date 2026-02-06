@@ -1,0 +1,25 @@
+project_name      = "s3-shard-ingest"
+region            = "us-east-1"
+bucket_name       = "replace-with-your-unique-bucket-name"
+
+worker_count      = 2
+instance_type     = "t4g.micro"
+key_name          = null
+ssh_ingress_cidrs = []
+assign_public_ip  = true
+subnet_ids        = []
+
+repo_url          = "https://github.com/your-org/s3-shard-ingest-worker.git"
+repo_ref          = "main"
+
+shard_prefix      = "shards/live"
+output_prefix     = "candlesticks_raw"
+worker_log_prefix = "worker_logs"
+
+max_rps           = 4
+threads           = 2
+memory_limit      = "512MB"
+
+tags = {
+  Environment = "dev"
+}
